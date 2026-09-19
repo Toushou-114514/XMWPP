@@ -10,6 +10,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @updateURL    https://raw.githubusercontent.com/Toushou-114514/XMWPP/refs/heads/toushou/xmw%2B%2B%202.2.js
+// @downloadURL  https://raw.githubusercontent.com/Toushou-114514/XMWPP/refs/heads/toushou/xmw%2B%2B%202.2.js
 // ==/UserScript==
 
 (function() {
