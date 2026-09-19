@@ -33,7 +33,7 @@ RGB模式	    让网页文字持续变色
 ## 📦 安装
 
 1. 安装Tampermonkey(油猴)浏览器扩展
-2. 导入发布的XMW++.js文件到油猴中
+2. 导入发布的XMW++.js文件到油猴中 或者[**一键安装 XMW++**](https://raw.githubusercontent.com/Toushou-114514/XMWPP/main/XMW++.user.js)
 3. 启用XMW++并刷新小码王社区页面
 
 
