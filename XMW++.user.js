@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         XMW++
 // @namespace    https://github.com/Toushou-114514/XMWPP
-// @version      2.2
+// @version      2.3
 // @description  小码王社区 · 多功能工具箱
 // @author       Toushou
 // @match        https://world.xiaomawang.com/*
@@ -92,6 +92,46 @@
     // ============================================================
     // 3. 功能实现
     // ============================================================
+
+    // 3.0 移除站点自带主页背景元素（无开关，脚本启用即生效）
+    const XMWPP_BG_REMOVE_SELECTOR = '.homeBGImage__2Jspw, [class*="homeBGImage__"]';
+    let bgRemoveObserver = null;
+
+    function removeSiteHomeBackground() {
+        let removed = 0;
+        try {
+            document.querySelectorAll(XMWPP_BG_REMOVE_SELECTOR).forEach(el => {
+                el.remove();
+                removed++;
+            });
+        } catch (e) {}
+        if (removed > 0) console.log('[XMW++] 已移除站点自带主页背景元素 x' + removed);
+        return removed;
+    }
+
+    // SPA 路由切换 / 组件重新渲染会再次插入，用观察器持续清理
+    function startRemovingSiteHomeBackground() {
+        removeSiteHomeBackground();
+        if (bgRemoveObserver) return;
+        bgRemoveObserver = new MutationObserver(mutations => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    try {
+                        if (node.matches(XMWPP_BG_REMOVE_SELECTOR)) {
+                            node.remove();
+                            continue;
+                        }
+                        if (node.querySelector(XMWPP_BG_REMOVE_SELECTOR)) {
+                            node.querySelectorAll(XMWPP_BG_REMOVE_SELECTOR).forEach(el => el.remove());
+                        }
+                    } catch (e) {}
+                }
+            }
+        });
+        bgRemoveObserver.observe(document.documentElement, { childList: true, subtree: true });
+        console.log('[XMW++] 站点自带背景元素移除已启用');
+    }
 
     // 3.1 用户ID
     function displayUserId() {
@@ -365,37 +405,310 @@
         console.log('[XMW++] RGB模式已启用');
     }
 
-    // 3.5 自定义壁纸
+    // 3.5 自定义网页壁纸（作用于本站所有页面）
+    //
+    // 站点只在个人主页有背景容器（div.bgImg__1veTq），其它页面根本没有带 bgImg 类的元素；
+    // 而单纯铺在最底层的图层，会被站点某个全屏不透明元素挡在后面。
+    // 所以这里走「兜底层 + 就地接管」两条路：
+    //   1. 兜底层：body 第一个子节点，position:fixed + z-index:-1，
+    //      永远在页面所有卡片、文字下面，管不到的地方由它兜底；
+    //   2. 就地接管：把站点那个全屏背景元素找出来，直接把我们的壁纸涂在它身上。
+    //      它本来就夹在卡片下面，所以最终效果 = 壁纸在所有卡片下面，同时压住站点原背景。
+    const XMWPP_WALLPAPER_STYLE_ID = 'xmwpp-wallpaper-style';
+    const XMWPP_WALLPAPER_LAYER_ID = 'xmwpp-wallpaper-layer';
+    const XMWPP_WALLPAPER_SCOPE_CLASS = 'xmwpp-wallpaper-on';
+    const XMWPP_WALLPAPER_PROPS = [
+        'background-image', 'background-color', 'background-size',
+        'background-position', 'background-repeat', 'background-attachment'
+    ];
+    // 站点背景元素的原始内联样式，用于「恢复默认」时还原
+    const wallpaperOriginals = new WeakMap();
+    let wallpaperBackdrops = [];
+    let lastBackdropScan = 0;
+    let wallpaperObserver = null;
+    let currentWallpaper = '';
+    let currentWallpaperIsColor = false;
+
+    function isColorValue(v) {
+        return typeof v === 'string' && /^#([0-9a-f]{3,8})$/i.test(v.trim());
+    }
+
+    function xmwppWallpaperLayersCss() {
+        const isColor = currentWallpaperIsColor;
+        const image = isColor ? 'none' : 'url("' + currentWallpaper + '")';
+        const placement = isColor ? '' : `
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;`;
+        return `
+            /* 兜底壁纸层：负 z-index，永远在页面所有卡片/文字下面 */
+            #${XMWPP_WALLPAPER_LAYER_ID} {
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                display: block !important;
+                pointer-events: none !important;
+                z-index: -1 !important;
+                background-image: ${image} !important;
+                background-color: ${isColor ? currentWallpaper : 'transparent'} !important;${placement}
+            }
+            /* html / body 保持透明，壁纸才能从页面内容背后透出来 */
+            html.${XMWPP_WALLPAPER_SCOPE_CLASS},
+            html.${XMWPP_WALLPAPER_SCOPE_CLASS} body {
+                background-color: transparent !important;
+                background-image: none !important;
+            }
+        `;
+    }
+
+    function ensureWallpaperLayer() {
+        let layer = document.getElementById(XMWPP_WALLPAPER_LAYER_ID);
+        if (!layer) {
+            layer = document.createElement('div');
+            layer.id = XMWPP_WALLPAPER_LAYER_ID;
+            layer.setAttribute('aria-hidden', 'true');
+        }
+        try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
+        // 挂在 body 第一个子节点：z-index:-1 的图层若父级建立了层叠上下文会失效
+        if (layer.parentNode !== document.body || document.body.firstChild !== layer) {
+            try { document.body.insertBefore(layer, document.body.firstChild); } catch (e) { return null; }
+        }
+        return layer;
+    }
+
+    // 样式表始终放到 head 末尾，保证优先级最高（不会被深色模式等后插入的样式盖掉）
+    function setWallpaperStyle(css) {
+        const old = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
+        if (old) old.remove();
+        if (!css) return;
+        const style = document.createElement('style');
+        style.id = XMWPP_WALLPAPER_STYLE_ID;
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    // 给兜底图层打内联样式，作为样式表被清掉时的兜底
+    function paintWallpaperLayer() {
+        const layer = ensureWallpaperLayer();
+        if (!layer) return 0;
+        try {
+            layer.style.setProperty('position', 'fixed', 'important');
+            layer.style.setProperty('top', '0', 'important');
+            layer.style.setProperty('left', '0', 'important');
+            layer.style.setProperty('width', '100vw', 'important');
+            layer.style.setProperty('height', '100vh', 'important');
+            layer.style.setProperty('pointer-events', 'none', 'important');
+            layer.style.setProperty('z-index', '-1', 'important');
+            if (currentWallpaperIsColor) {
+                layer.style.setProperty('background-image', 'none', 'important');
+                layer.style.setProperty('background-color', currentWallpaper, 'important');
+            } else {
+                layer.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
+                layer.style.setProperty('background-color', 'transparent', 'important');
+                layer.style.setProperty('background-size', 'cover', 'important');
+                layer.style.setProperty('background-position', 'center center', 'important');
+                layer.style.setProperty('background-repeat', 'no-repeat', 'important');
+            }
+        } catch (e) {}
+        return 1;
+    }
+
+    // ---------- 找出站点自己的全屏背景元素（就是挡住壁纸的那个） ----------
+
+    // 背景是否「不透明」：带 alpha 的底色或任意背景图都算
+    function hasOpaquePaint(cs) {
+        const bg = (cs.backgroundColor || '').replace(/\s/g, '');
+        let alpha = 0;
+        if (bg.indexOf('rgb(') === 0) {
+            alpha = 1;
+        } else if (bg.indexOf('rgba(') === 0) {
+            const v = bg.slice(5, -1).split(',');
+            alpha = v.length === 4 ? parseFloat(v[3]) : 1;
+        }
+        if (alpha > 0.5) return true;
+        return !!cs.backgroundImage && cs.backgroundImage !== 'none';
+    }
+
+    // 判定标准：铺满视口 + 底色不透明（或带背景图）+ 不是弹窗遮罩
+    function isFullScreenBackdrop(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.id === XMWPP_WALLPAPER_LAYER_ID) return false;
+        if (el === document.body || el === document.documentElement) return false;
+        if (!el.classList) return false;
+        if (el.classList.contains('xmwpp-toolkit-popup') ||
+            el.classList.contains('xmwpp-toolkit-popup-overlay') ||
+            el.classList.contains('xmwpp-float-ball')) return false;
+        let cs;
+        try { cs = window.getComputedStyle(el); } catch (e) { return false; }
+        if (!cs) return false;
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        if (parseFloat(cs.opacity || '1') === 0) return false;
+        if (!hasOpaquePaint(cs)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < window.innerWidth * 0.9 || r.height < window.innerHeight * 0.9) return false;
+        if (r.top > 8 || r.left > 8) return false;
+        const z = parseInt(cs.zIndex, 10);
+        if (!isNaN(z) && z > 900) return false;   // 疑似弹窗/浮层遮罩，不碰
+        return true;
+    }
+
+    function collectBackdropCandidates() {
+        const out = [];
+        const push = el => { if (el && out.indexOf(el) < 0) out.push(el); };
+        if (!document.body) return out;
+
+        // 1) 命中测试：视口中心这一列上的所有元素（从最上层到最下层）
+        try {
+            const stack = document.elementsFromPoint(window.innerWidth / 2, window.innerHeight / 2) || [];
+            for (let i = stack.length - 1; i >= 0; i--) push(stack[i]);
+        } catch (e) {}
+
+        // 2) body 前两层的子元素
+        try {
+            let inspected = 0;
+            const scan = (parent, depth) => {
+                if (!parent || depth > 2 || inspected > 200) return;
+                for (const el of parent.children) {
+                    if (inspected++ > 200) return;
+                    push(el);
+                    if (depth < 2) scan(el, depth + 1);
+                }
+            };
+            scan(document.body, 0);
+        } catch (e) {}
+
+        // 3) 名字里带 bg / background / backdrop 的元素（pointer-events:none 也能捞到）
+        try {
+            const named = document.querySelectorAll(
+                '[class*="bg" i], [id*="bg" i], [class*="background" i], [id*="background" i],' +
+                '[class*="backdrop" i], [id*="backdrop" i]'
+            );
+            for (let i = 0; i < named.length && i < 400; i++) push(named[i]);
+        } catch (e) {}
+
+        return out;
+    }
+
+    function readBackdropStyle(el) {
+        const saved = {};
+        for (const prop of XMWPP_WALLPAPER_PROPS) {
+            saved[prop] = el.style.getPropertyValue(prop);
+            saved[prop + '!'] = el.style.getPropertyPriority(prop);
+        }
+        return saved;
+    }
+
+    function resetBackdrop(el) {
+        const saved = wallpaperOriginals.get(el);
+        if (!saved) return;
+        for (const prop of XMWPP_WALLPAPER_PROPS) {
+            try {
+                if (saved[prop]) el.style.setProperty(prop, saved[prop], saved[prop + '!'] || '');
+                else el.style.removeProperty(prop);
+            } catch (e) {}
+        }
+        wallpaperOriginals.delete(el);
+    }
+
+    function paintBackdrop(el) {
+        if (!wallpaperOriginals.has(el)) wallpaperOriginals.set(el, readBackdropStyle(el));
+        try {
+            if (currentWallpaperIsColor) {
+                el.style.setProperty('background-image', 'none', 'important');
+                el.style.setProperty('background-color', currentWallpaper, 'important');
+            } else {
+                el.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
+                el.style.setProperty('background-size', 'cover', 'important');
+                el.style.setProperty('background-position', 'center center', 'important');
+                el.style.setProperty('background-repeat', 'no-repeat', 'important');
+                el.style.setProperty('background-attachment', 'fixed', 'important');
+            }
+        } catch (e) {}
+    }
+
+    // 把壁纸涂到站点自己的全屏背景元素上（它本来就在卡片下面）
+    function paintSiteBackdrops() {
+        const next = collectBackdropCandidates().filter(isFullScreenBackdrop);
+        wallpaperBackdrops.forEach(el => { if (next.indexOf(el) < 0) resetBackdrop(el); });
+        wallpaperBackdrops = next;
+        next.forEach(paintBackdrop);
+        return next.length;
+    }
+
+    // 高频调用时的省流路径：背景元素还在就只重涂，最多 1.5s 做一次完整重扫
+    function refreshSiteBackdrops() {
+        const now = Date.now();
+        const alive = wallpaperBackdrops.length > 0 && wallpaperBackdrops.every(el => el.isConnected);
+        if (alive && now - lastBackdropScan < 1500) {
+            wallpaperBackdrops.forEach(paintBackdrop);
+            return wallpaperBackdrops.length;
+        }
+        lastBackdropScan = now;
+        return paintSiteBackdrops();
+    }
+
+    function startWallpaperObserver() {
+        if (wallpaperObserver) return;
+        let queued = false;
+        wallpaperObserver = new MutationObserver(() => {
+            if (!currentWallpaper || queued) return;
+            queued = true;
+            setTimeout(() => {
+                queued = false;
+                if (!currentWallpaper) return;
+                const style = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
+                if (!style || style !== document.head.lastElementChild) {
+                    setWallpaperStyle(xmwppWallpaperLayersCss());
+                }
+                try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
+                paintWallpaperLayer();
+                refreshSiteBackdrops();
+            }, 300);
+        });
+        wallpaperObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+
+    function clearWallpaper() {
+        if (wallpaperObserver) {
+            wallpaperObserver.disconnect();
+            wallpaperObserver = null;
+        }
+        wallpaperBackdrops.forEach(resetBackdrop);
+        wallpaperBackdrops = [];
+        const layer = document.getElementById(XMWPP_WALLPAPER_LAYER_ID);
+        if (layer) layer.remove();
+        setWallpaperStyle('');
+        try { document.documentElement.classList.remove(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
+        currentWallpaper = '';
+        currentWallpaperIsColor = false;
+    }
+
     function applyWallpaper(url) {
-        if (!url || !url.trim()) {
+        const value = (url || '').trim();
+        if (!value) {
             restoreDefaultWallpaper();
             return;
         }
-
-        const bg = document.querySelector('div.bgImg__1veTq');
-        if (bg) {
-            const trimmed = url.trim();
-            if (trimmed.startsWith('#')) {
-                bg.style.setProperty('background-image', 'none', 'important');
-                bg.style.setProperty('background-color', trimmed, 'important');
-                console.log('[XMW++] 纯色背景已应用:', trimmed);
-            } else {
-                bg.style.setProperty('background-image', `url(${trimmed})`, 'important');
-                bg.style.setProperty('background-size', 'cover', 'important');
-                bg.style.setProperty('background-position', 'center center', 'important');
-                bg.style.setProperty('background-repeat', 'no-repeat', 'important');
-                bg.style.setProperty('background-attachment', 'fixed', 'important');
-                console.log('[XMW++] 壁纸已应用 (cover模式)');
-            }
-        }
+        currentWallpaper = value;
+        currentWallpaperIsColor = isColorValue(value);
+        setWallpaperStyle(xmwppWallpaperLayersCss());
+        paintWallpaperLayer();
+        lastBackdropScan = Date.now();
+        const n = paintSiteBackdrops();
+        startWallpaperObserver();
+        console.log('[XMW++] 全站壁纸已应用:', currentWallpaperIsColor ? currentWallpaper : '(图片) ' + currentWallpaper,
+                    '| 已接管站点背景元素 ' + n + ' 个');
     }
 
     function restoreDefaultWallpaper() {
-        const bg = document.querySelector('div.bgImg__1veTq');
-        if (bg) {
-            bg.style.setProperty('background-image', '', 'important');
-            bg.style.setProperty('background-color', '', 'important');
-        }
+        clearWallpaper();
         settings.wallpaperUrl = '';
         saveSettings();
         console.log('[XMW++] 已恢复默认背景');
@@ -1092,7 +1405,7 @@
                     <div>
                         <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;">
                             <div style="display:flex;align-items:center;gap:12px;">
-                                <span style="font-weight:500;color:#333;font-size:13.5px;">自定义主页壁纸</span>
+                                <span style="font-weight:500;color:#333;font-size:13.5px;">自定义网页壁纸</span>
                                 <span style="font-size:11.5px;color:${state.wallpaper ? '#22c55e' : '#999'};">状态: ${state.wallpaper ? '已启用' : '未启用'}</span>
                             </div>
                             <button id="xmwpp-toggle-wallpaper" style="background:${state.wallpaper ? '#ccc' : '#7c5cff'};color:#fff;border:none;padding:5px 18px;border-radius:22px;font-size:12.5px;cursor:pointer;font-weight:500;">${state.wallpaper ? '关闭' : '启用'}</button>
@@ -1218,7 +1531,7 @@
                         <div style="font-size:19px;font-weight:700;color:#0f172a;margin-bottom:5px;">XMW++</div>
                         <div style="font-size:13px;color:#888;margin-bottom:24px;">小码王社区 · 多功能工具箱</div>
                         <div style="font-size:13px;color:#555;line-height:2;text-align:left;max-width:320px;margin:0 auto;">
-                            <div style="display:flex;justify-content:space-between;"><span style="color:#999;">版本</span><span style="font-weight:500;">v2.2</span></div>
+                            <div style="display:flex;justify-content:space-between;"><span style="color:#999;">版本</span><span style="font-weight:500;">v2.3</span></div>
                             <div style="display:flex;justify-content:space-between;"><span style="color:#999;">作者</span><span style="font-weight:500;">Toushou</span></div>
                             <div style="display:flex;justify-content:space-between;"><span style="color:#999;">许可</span><span style="font-weight:500;">MIT</span></div>
                         </div>
@@ -1501,6 +1814,7 @@
 
     function init() {
         initZoom();
+        startRemovingSiteHomeBackground();
 
         setTimeout(addFloatingBall, 1000);
         setTimeout(addFloatingBall, 3000);
@@ -1528,7 +1842,7 @@
             setTimeout(() => toggleAutoLinkify(true), 1200);
         }
 
-        console.log('[XMW++] 已加载 v2.2');
+        console.log('[XMW++] 已加载 v2.3');
         console.log('[XMW++] 仓库: https://github.com/Toushou-114514/XMWPP');
     }
 
