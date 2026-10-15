@@ -136,6 +136,62 @@
         console.log('[XMW++] 站点元素移除已启用');
     }
 
+    // 检测到 404 页面元素就自动刷新
+    // 依旧叠石山
+    const XMWPP_404_SELECTOR = '.page-bg404__3PIbq, [class*="page-bg404__"]';
+    const XMWPP_404_SESSION_KEY = 'xmwpp_404_last_reload';
+    const XMWPP_404_RELOAD_GAP = 0;   
+    let refresh404Observer = null;
+    let reload404Timer = null;
+
+    function is404Page() {
+        try {
+            return !!document.querySelector(XMWPP_404_SELECTOR);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // 持续检测
+    function watch404Page() {
+        if (refresh404Observer) return;
+        refresh404Observer = new MutationObserver(() => schedule404Reload());
+        try {
+            refresh404Observer.observe(document.documentElement, { childList: true, subtree: true });
+        } catch (e) {
+            refresh404Observer = null;
+            return;
+        }
+        console.log('[XMW++] 404 自动刷新检测已启用');
+        schedule404Reload();
+    }
+
+    function schedule404Reload() {
+        if (reload404Timer) return;
+        reload404Timer = setTimeout(() => {
+            reload404Timer = null;
+            try { trigger404Reload(); } catch (e) {}
+        }, 800);
+    }
+
+    function trigger404Reload() {
+        if (!is404Page()) return false;
+
+        // 我是乐子
+        const now = Date.now();
+        let last = 0;
+        try { last = parseInt(sessionStorage.getItem(XMWPP_404_SESSION_KEY), 10) || 0; } catch (e) {}
+        if (now - last < XMWPP_404_RELOAD_GAP) {
+            console.log('[XMW++] 检测到 404 页面，但刚刚刷新过，停止以免无限刷新');
+            return false;
+        }
+        try { sessionStorage.setItem(XMWPP_404_SESSION_KEY, String(now)); } catch (e) {}
+
+        console.log('[XMW++] 🔄 检测到 404 页面，正在自动刷新');
+        location.reload();
+        return true;
+    }
+
     // 3.1 用户ID
     function displayUserId() {
         if (!settings.showUserId) return;
@@ -1818,6 +1874,7 @@
     function init() {
         initZoom();
         startRemovingSiteElements();
+        watch404Page();
 
         setTimeout(addFloatingBall, 1000);
         setTimeout(addFloatingBall, 3000);
