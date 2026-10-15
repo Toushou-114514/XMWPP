@@ -37,7 +37,7 @@
 ## 📦 安装
 
 1. 安装Tampermonkey(油猴)浏览器扩展，并启用*允许用户脚本*
-2. 导入发布的XMW++.js文件到油猴中 或者[**点我一键安装 XMW++**](https://raw.githubusercontent.com/Toushou-114514/XMWPP/toushou/XMW++.user.js)
+2. 导入上面文件发布的XMW++.js文件到油猴中 或者[**点我一键安装 XMW++**](https://raw.githubusercontent.com/Toushou-114514/XMWPP/toushou/XMW++.user.js)
 3. 启用XMW++并刷新[**小码王社区**](https://world.xiaomawang.com/)页面
 
 
