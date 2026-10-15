@@ -93,44 +93,47 @@
     // 3. 功能实现
     // ============================================================
 
-    // 3.0 移除站点自带主页背景元素（无开关，脚本启用即生效）
-    const XMWPP_BG_REMOVE_SELECTOR = '.homeBGImage__2Jspw, [class*="homeBGImage__"]';
-    let bgRemoveObserver = null;
+    // 3.0 强制移除的站点元素（无开关，脚本启用即生效）
+    const XMWPP_REMOVE_SELECTOR = [
+        '.homeBGImage__2Jspw', '[class*="homeBGImage__"]',   // 主页自带背景
+        '.footer-container__3UMss', '[class*="footer-container__"]'  // 页脚
+    ].join(',');
+    let removeObserver = null;
 
-    function removeSiteHomeBackground() {
+    function removeSiteElements() {
         let removed = 0;
         try {
-            document.querySelectorAll(XMWPP_BG_REMOVE_SELECTOR).forEach(el => {
+            document.querySelectorAll(XMWPP_REMOVE_SELECTOR).forEach(el => {
                 el.remove();
                 removed++;
             });
         } catch (e) {}
-        if (removed > 0) console.log('[XMW++] 已移除站点自带主页背景元素 x' + removed);
+        if (removed > 0) console.log('[XMW++] 已移除站点元素 x' + removed);
         return removed;
     }
 
     // SPA 路由切换 / 组件重新渲染会再次插入，用观察器持续清理
-    function startRemovingSiteHomeBackground() {
-        removeSiteHomeBackground();
-        if (bgRemoveObserver) return;
-        bgRemoveObserver = new MutationObserver(mutations => {
+    function startRemovingSiteElements() {
+        removeSiteElements();
+        if (removeObserver) return;
+        removeObserver = new MutationObserver(mutations => {
             for (const m of mutations) {
                 for (const node of m.addedNodes) {
                     if (node.nodeType !== 1) continue;
                     try {
-                        if (node.matches(XMWPP_BG_REMOVE_SELECTOR)) {
+                        if (node.matches(XMWPP_REMOVE_SELECTOR)) {
                             node.remove();
                             continue;
                         }
-                        if (node.querySelector(XMWPP_BG_REMOVE_SELECTOR)) {
-                            node.querySelectorAll(XMWPP_BG_REMOVE_SELECTOR).forEach(el => el.remove());
+                        if (node.querySelector(XMWPP_REMOVE_SELECTOR)) {
+                            node.querySelectorAll(XMWPP_REMOVE_SELECTOR).forEach(el => el.remove());
                         }
                     } catch (e) {}
                 }
             }
         });
-        bgRemoveObserver.observe(document.documentElement, { childList: true, subtree: true });
-        console.log('[XMW++] 站点自带背景元素移除已启用');
+        removeObserver.observe(document.documentElement, { childList: true, subtree: true });
+        console.log('[XMW++] 站点元素移除已启用');
     }
 
     // 3.1 用户ID
@@ -1814,7 +1817,7 @@
 
     function init() {
         initZoom();
-        startRemovingSiteHomeBackground();
+        startRemovingSiteElements();
 
         setTimeout(addFloatingBall, 1000);
         setTimeout(addFloatingBall, 3000);
