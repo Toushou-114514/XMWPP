@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         XMW++
 // @namespace    https://github.com/Toushou-114514/XMWPP
-// @version      2.3
+// @version      2.3.1
 // @description  小码王社区 · 多功能工具箱
 // @author       Toushou
 // @match        https://world.xiaomawang.com/*
@@ -136,58 +136,88 @@
         console.log('[XMW++] 站点元素移除已启用');
     }
 
-    // 检测到 404 页面元素就自动刷新
-    // 依旧叠石山
+    // 3.0b 检测到 404 页面就自动刷新（无开关，脚本启用即生效）
+    //
+    // 注意：不能在「任意页面「顺带」渲染出这个 404 装饰块」时就刷新 ——
+    // SPA 每次切换路由都会短暂渲染上一条路由残留的组件，若此时命中 404 元素就 reload，
+    // 表现就是「每打开一个新链接都 404 一次，手动刷新才正常」。
+    // 所以只有同时满足下面条件才算真的 404 页面：
+    //   1. 存在 404 元素；
+    //   2. 当前路由对应的主内容区里**没有真正的内容**（卡片/列表等），
+    //      只认主内容区，不认页头页脚，避免被残留的 404 块误导；
+    //   3. 该页面的 404 状态连续多次检测都成立（稳住 ~1.2s 以上），排除路由切换过程中的瞬时态。
+    // 另外同一 URL 只自动刷新一次（sessionStorage 记录），避免刷新后仍是 404 造成死循环。
     const XMWPP_404_SELECTOR = '.page-bg404__3PIbq, [class*="page-bg404__"]';
-    const XMWPP_404_SESSION_KEY = 'xmwpp_404_last_reload';
-    const XMWPP_404_RELOAD_GAP = 0;   
+    const XMWPP_404_KEY_PREFIX = 'xmwpp_404_reloaded:';
+    const XMWPP_404_HITS_NEEDED = 3;      // 连续命中次数
+    const XMWPP_404_HIT_INTERVAL = 400;   // 每次检测间隔(ms)
     let refresh404Observer = null;
     let reload404Timer = null;
+    let hits404 = 0;
 
+    // 真的 404 页面：404 元素在主内容区里，且主内容区没有实际内容
     function is404Page() {
-        try {
-            return !!document.querySelector(XMWPP_404_SELECTOR);
-        } catch (e) {
-            return false;
+        let node;
+        try { node = document.querySelector(XMWPP_404_SELECTOR); } catch (e) { return false; }
+        if (!node) return false;
+
+        // 从 404 元素往上找「主内容区」：范围内除了 404 块本身，不应存在卡片/列表等内容
+        let scope = node.parentElement;
+        for (let depth = 0; scope && depth < 6; depth++) {
+            const hasOtherContent = Array.prototype.some.call(
+                scope.querySelectorAll('a[href]:not(' + XMWPP_404_SELECTOR + ')'),
+                a => a.offsetParent !== null && !a.closest('header, nav, footer')
+            );
+            if (hasOtherContent) return true;   // 有其它可见内容 → 是正常页面里的顺带渲染
+            scope = scope.parentElement;
         }
+        return true;
     }
 
-    // 持续检测
     function watch404Page() {
+        schedule404Reload();
         if (refresh404Observer) return;
         refresh404Observer = new MutationObserver(() => schedule404Reload());
         try {
             refresh404Observer.observe(document.documentElement, { childList: true, subtree: true });
         } catch (e) {
             refresh404Observer = null;
-            return;
         }
-        console.log('[XMW++] 404 自动刷新检测已启用');
-        schedule404Reload();
     }
 
     function schedule404Reload() {
         if (reload404Timer) return;
         reload404Timer = setTimeout(() => {
             reload404Timer = null;
-            try { trigger404Reload(); } catch (e) {}
-        }, 800);
+            try { check404(); } catch (e) {}
+        }, XMWPP_404_HIT_INTERVAL);
+    }
+
+    // 连续命中若干次才刷新，避免路由切换瞬间的误判
+    function check404() {
+        if (!is404Page()) {
+            hits404 = 0;
+            return false;
+        }
+        hits404++;
+        if (hits404 < XMWPP_404_HITS_NEEDED) {
+            schedule404Reload();
+            return false;
+        }
+        return trigger404Reload();
     }
 
     function trigger404Reload() {
-        if (!is404Page()) return false;
-
-        // 我是乐子
-        const now = Date.now();
-        let last = 0;
-        try { last = parseInt(sessionStorage.getItem(XMWPP_404_SESSION_KEY), 10) || 0; } catch (e) {}
-        if (now - last < XMWPP_404_RELOAD_GAP) {
-            console.log('[XMW++] 检测到 404 页面，但刚刚刷新过，停止以免无限刷新');
+        const url = location.href;
+        let already = null;
+        try { already = sessionStorage.getItem(XMWPP_404_KEY_PREFIX + url); } catch (e) {}
+        if (already) {
+            console.log('[XMW++] 检测到 404 页面，但该地址已经自动刷新过一次，不再刷新');
             return false;
         }
-        try { sessionStorage.setItem(XMWPP_404_SESSION_KEY, String(now)); } catch (e) {}
+        try { sessionStorage.setItem(XMWPP_404_KEY_PREFIX + url, String(Date.now())); } catch (e) {}
 
-        console.log('[XMW++] 🔄 检测到 404 页面，正在自动刷新');
+        console.log('[XMW++] 🔄 检测到 404 页面，正在自动刷新:', url);
         location.reload();
         return true;
     }
@@ -579,6 +609,70 @@
         return 1;
     }
 
+    // ---------- 站点背景元素 div.bgImg__1veTq 的图片地址同步 ----------
+
+    // 精确匹配页面里的 bgImg 背景元素（含各种 hash 后缀）
+    const XMWPP_BGIMG_SELECTOR = 'div.bgImg__1veTq, div[class*="bgImg__"], div[class*="BgImg__"]';
+    const bgImgOriginals = new WeakMap();
+    let syncedBgImg = [];
+
+    // 从内联 style 或计算样式里取出 background-image 的 url
+    function extractBgUrl(el) {
+        let raw = '';
+        try { raw = el.style.getPropertyValue('background-image') || ''; } catch (e) {}
+        if (!raw || raw === 'none') {
+            try {
+                const cs = window.getComputedStyle(el);
+                raw = (cs && cs.backgroundImage) || '';
+            } catch (e) {}
+        }
+        if (!raw || raw === 'none') return '';
+        const m = raw.match(/url\((['"]?)(.*?)\1\)/i);
+        return m && m[2] ? m[2] : '';
+    }
+
+    // 把 bgImg 元素上原有的图片地址换成我们设置的地址（纯色模式保留站点原图，不做改动）
+    function syncBgImgElement(el) {
+        if (!currentWallpaper || currentWallpaperIsColor) return false;
+        const oldUrl = extractBgUrl(el);
+        try {
+            if (!bgImgOriginals.has(el)) bgImgOriginals.set(el, oldUrl);
+            el.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
+            el.style.setProperty('background-size', 'cover', 'important');
+            el.style.setProperty('background-position', 'center center', 'important');
+            el.style.setProperty('background-repeat', 'no-repeat', 'important');
+        } catch (e) {
+            return false;
+        }
+        if (oldUrl && oldUrl !== currentWallpaper) {
+            console.log('[XMW++] bgImg 图片地址已同步:', oldUrl, '->', currentWallpaper);
+        }
+        return true;
+    }
+
+    function resetBgImgElement(el) {
+        const original = bgImgOriginals.get(el);
+        bgImgOriginals.delete(el);
+        if (original === undefined) return;
+        try {
+            if (original) el.style.setProperty('background-image', 'url("' + original + '")', 'important');
+            else el.style.removeProperty('background-image');
+        } catch (e) {}
+    }
+
+    // 遍历页面上所有 bgImg 元素并同步（新出现的元素也会被找到）
+    function syncAllBgImgElements() {
+        const next = [];
+        try {
+            document.querySelectorAll(XMWPP_BGIMG_SELECTOR).forEach(el => {
+                if (syncBgImgElement(el)) next.push(el);
+            });
+        } catch (e) {}
+        syncedBgImg.forEach(el => { if (next.indexOf(el) < 0) resetBgImgElement(el); });
+        syncedBgImg = next;
+        return next.length;
+    }
+
     // ---------- 找出站点自己的全屏背景元素（就是挡住壁纸的那个） ----------
 
     // 背景是否「不透明」：带 alpha 的底色或任意背景图都算
@@ -729,6 +823,7 @@
                 try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
                 paintWallpaperLayer();
                 refreshSiteBackdrops();
+                syncAllBgImgElements();
             }, 300);
         });
         wallpaperObserver.observe(document.documentElement, { childList: true, subtree: true });
@@ -741,6 +836,8 @@
         }
         wallpaperBackdrops.forEach(resetBackdrop);
         wallpaperBackdrops = [];
+        syncedBgImg.forEach(resetBgImgElement);
+        syncedBgImg = [];
         const layer = document.getElementById(XMWPP_WALLPAPER_LAYER_ID);
         if (layer) layer.remove();
         setWallpaperStyle('');
@@ -761,6 +858,7 @@
         paintWallpaperLayer();
         lastBackdropScan = Date.now();
         const n = paintSiteBackdrops();
+        const m = syncAllBgImgElements();
         startWallpaperObserver();
         console.log('[XMW++] 全站壁纸已应用:', currentWallpaperIsColor ? currentWallpaper : '(图片) ' + currentWallpaper,
                     '| 已接管站点背景元素 ' + n + ' 个');
