@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         XMW++
 // @namespace    https://github.com/Toushou-114514/XMWPP
-// @version      2.3.1
+// @version      2.3.2
 // @description  小码王社区 · 多功能工具箱
 // @author       Toushou
 // @match        https://world.xiaomawang.com/*
@@ -33,6 +33,7 @@
         customFont: '',
         wallpaperUrl: '',
         autoLinkify: false,
+        autoReload404: false,
         floatPos: { x: null, y: null },
     };
 
@@ -93,50 +94,38 @@
     // 3. 功能实现
     // ============================================================
 
-    // 3.0 强制移除的站点元素（无开关，脚本启用即生效）
+    // 3.0 隐藏站点元素（主页自带背景 / 页脚）
+    //
+    // ⚠️ 关键：本站是 React/Next。用 el.remove() 删掉它管理的节点，会让 React 在
+    // 下一次路由切换做协调时报 removeChild / Failed to execute 之类的错，Next 就会
+    // 渲染出错误页 —— 而本站的错误页正是那个「去火星」的 404 页（_error 内部就是
+    // pageBg404），表现为「每次跳转都 404 一次，刷新才正常」。
+    // 所以这里改成注入 CSS 隐藏：视觉完全一致，但不碰 DOM，SPA 重渲染自动生效，
+    // 也不会破坏 React。
     const XMWPP_REMOVE_SELECTOR = [
-        '.homeBGImage__2Jspw', '[class*="homeBGImage__"]',   // 主页自带背景
+        '.homeBGImage__2Jspw', '[class*="homeBGImage__"]',           // 主页自带背景
         '.footer-container__3UMss', '[class*="footer-container__"]'  // 页脚
     ].join(',');
-    let removeObserver = null;
+    const XMWPP_REMOVE_STYLE_ID = 'xmwpp-hide-site-elements';
 
-    function removeSiteElements() {
-        let removed = 0;
-        try {
-            document.querySelectorAll(XMWPP_REMOVE_SELECTOR).forEach(el => {
-                el.remove();
-                removed++;
-            });
-        } catch (e) {}
-        if (removed > 0) console.log('[XMW++] 已移除站点元素 x' + removed);
-        return removed;
-    }
-
-    // SPA 路由切换 / 组件重新渲染会再次插入，用观察器持续清理
     function startRemovingSiteElements() {
-        removeSiteElements();
-        if (removeObserver) return;
-        removeObserver = new MutationObserver(mutations => {
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType !== 1) continue;
-                    try {
-                        if (node.matches(XMWPP_REMOVE_SELECTOR)) {
-                            node.remove();
-                            continue;
-                        }
-                        if (node.querySelector(XMWPP_REMOVE_SELECTOR)) {
-                            node.querySelectorAll(XMWPP_REMOVE_SELECTOR).forEach(el => el.remove());
-                        }
-                    } catch (e) {}
-                }
-            }
-        });
-        removeObserver.observe(document.documentElement, { childList: true, subtree: true });
-        console.log('[XMW++] 站点元素移除已启用');
+        if (document.getElementById(XMWPP_REMOVE_STYLE_ID)) return;
+        const css = XMWPP_REMOVE_SELECTOR.split(',')
+            .map(s => s.trim())
+            .filter(Boolean)
+            .map(s => s + '{display:none !important;}')
+            .join('\n');
+        const style = document.createElement('style');
+        style.id = XMWPP_REMOVE_STYLE_ID;
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+        console.log('[XMW++] 站点元素隐藏已启用');
     }
 
-    // 3.0b 检测到 404 页面就自动刷新（无开关，脚本启用即生效）
+    // 3.0b 检测到 404 页面就自动刷新（默认关闭，可在「功能设置」里手动开启）
+    //
+    // ⚠️ 本站在站内跳转时会顺带渲染出 404 装饰块，且站点对很多路由的「整页 GET」会返回 404 页，
+    // 因此这个功能很容易误判 / 误刷新，默认保持关闭（settings.autoReload404 = false）。
     //
     // 注意：不能在「任意页面「顺带」渲染出这个 404 装饰块」时就刷新 ——
     // SPA 每次切换路由都会短暂渲染上一条路由残留的组件，若此时命中 404 元素就 reload，
@@ -151,37 +140,84 @@
     const XMWPP_404_KEY_PREFIX = 'xmwpp_404_reloaded:';
     const XMWPP_404_HITS_NEEDED = 3;      // 连续命中次数
     const XMWPP_404_HIT_INTERVAL = 400;   // 每次检测间隔(ms)
+    const XMWPP_404_SETTLE_MS = 800;      // 判定前要求页面「安静」的时长(ms)
     let refresh404Observer = null;
     let reload404Timer = null;
     let hits404 = 0;
+    let last404MutationAt = 0;
 
-    // 真的 404 页面：404 元素在主内容区里，且主内容区没有实际内容
+    // 主内容区里算作「真实内容」的元素
+    const XMWPP_404_CONTENT_SELECTOR =
+        'a[href], img, video, canvas, button, input, textarea, select, p, li, h1, h2, h3, h4, h5, h6';
+
+    // 元素当前是否真的可见（排除 display:none / visibility:hidden / 透明 / 零尺寸；
+    // 兼容 position:fixed 这类 offsetParent 为 null 的元素，所以用 rect 判断尺寸）
+    function isVisibleFor404(el) {
+        if (!el || el.nodeType !== 1) return false;
+        let cs;
+        try { cs = window.getComputedStyle(el); } catch (e) { return false; }
+        if (!cs || cs.display === 'none' || cs.visibility === 'hidden' ||
+            parseFloat(cs.opacity || '1') === 0) return false;
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+        return r.width > 1 && r.height > 1;
+    }
+
+    // 该层范围内（排除 404 块自身、页头页脚）是否存在真实内容
+    function has404ScopeContent(scope, node) {
+        let els;
+        try { els = scope.querySelectorAll(XMWPP_404_CONTENT_SELECTOR); } catch (e) { return false; }
+        for (const el of els) {
+            if (node.contains(el) || el.contains(node)) continue;  // 404 装饰块自身 / 包住它的外层
+            if (el.closest('header, nav, footer')) continue;       // 页头页脚不算正文
+            if (!isVisibleFor404(el)) continue;
+            const tag = el.tagName;
+            if (tag === 'IMG' || tag === 'VIDEO' || tag === 'CANVAS' || tag === 'BUTTON' ||
+                tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+            if ((el.textContent || '').trim().length >= 2) return true;
+        }
+        return false;
+    }
+
+    // 真的 404 页面：可见的 404 元素 + 它所在的「主内容区」里没有真实内容
     function is404Page() {
         let node;
         try { node = document.querySelector(XMWPP_404_SELECTOR); } catch (e) { return false; }
         if (!node) return false;
+        // 站点常在 DOM 里保留一份隐藏的 404 模板/残留块，先排除不可见的
+        if (!isVisibleFor404(node)) return false;
 
-        // 从 404 元素往上找「主内容区」：范围内除了 404 块本身，不应存在卡片/列表等内容
+        // 从 404 元素往上找「主内容区」：只要哪一层范围里出现了真实内容，
+        // 就说明只是正常页面里的顺带渲染，不是 404 页
         let scope = node.parentElement;
-        for (let depth = 0; scope && depth < 6; depth++) {
-            const hasOtherContent = Array.prototype.some.call(
-                scope.querySelectorAll('a[href]:not(' + XMWPP_404_SELECTOR + ')'),
-                a => a.offsetParent !== null && !a.closest('header, nav, footer')
-            );
-            if (hasOtherContent) return true;   // 有其它可见内容 → 是正常页面里的顺带渲染
-            scope = scope.parentElement;
+        for (let depth = 0; scope && depth < 6; scope = scope.parentElement, depth++) {
+            if (has404ScopeContent(scope, node)) return false;
         }
-        return true;
+        return true;   // 主内容区确实空 → 是真的 404
     }
 
     function watch404Page() {
         schedule404Reload();
         if (refresh404Observer) return;
-        refresh404Observer = new MutationObserver(() => schedule404Reload());
+        refresh404Observer = new MutationObserver(() => {
+            last404MutationAt = Date.now();
+            schedule404Reload();
+        });
         try {
             refresh404Observer.observe(document.documentElement, { childList: true, subtree: true });
         } catch (e) {
             refresh404Observer = null;
+        }
+    }
+
+    // 统一的启停入口（供设置项调用）
+    function set404Watcher(enable) {
+        if (enable) {
+            watch404Page();
+        } else {
+            if (refresh404Observer) { refresh404Observer.disconnect(); refresh404Observer = null; }
+            if (reload404Timer) { clearTimeout(reload404Timer); reload404Timer = null; }
+            hits404 = 0;
         }
     }
 
@@ -193,10 +229,16 @@
         }, XMWPP_404_HIT_INTERVAL);
     }
 
-    // 连续命中若干次才刷新，避免路由切换瞬间的误判
+    // 连续命中若干次才刷新，且要求页面已经「安静」下来，避免路由切换/加载过程中的误判
     function check404() {
         if (!is404Page()) {
             hits404 = 0;
+            return false;
+        }
+        // 有 404 元素，但页面还在频繁变化（路由切换、数据加载中）→ 先不计入，稍后再看
+        if (Date.now() - last404MutationAt < XMWPP_404_SETTLE_MS) {
+            hits404 = 0;
+            schedule404Reload();
             return false;
         }
         hits404++;
@@ -321,90 +363,360 @@
         document.querySelectorAll('.xmwpp-user-id, .xmwpp-card-info').forEach(el => el.remove());
     }
 
-    // 3.2 深色模式
-    function toggleDarkMode(enable) {
-        const styleId = 'xmwpp-dark-mode';
-        const oldStyle = document.getElementById(styleId);
-        if (oldStyle) oldStyle.remove();
-        if (!enable) return;
+    // 3.2 深色模式（重写版）
+    //
+    // 与旧版的区别：
+    //   - 配色集中为 CSS 变量，开/关只在 <html> 上加删一个 scope class，无残留；
+    //   - 不再「猜」站点哈希类名，而是运行时读 computedStyle，
+    //     把「浅色底 / 深色字 / 浅色描边 / 纯文字链接」分别打标记类，由固定样式表统一映射；
+    //   - 只在首次全量 + 后续新增节点增量扫描，带节流，避免整页反复重扫；
+    //   - color-scheme: dark 让原生控件 / 滚动条自动跟随，减少硬覆盖。
+    const XMWPP_DARK_STYLE_ID = 'xmwpp-dark-mode';
+    const XMWPP_DARK_SCOPE_CLASS = 'xmwpp-dark-mode';
+    const XMWPP_DARK_SURFACE_CLASS = 'xmwpp-dm-surface';
+    const XMWPP_DARK_INK_CLASS = 'xmwpp-dm-ink';
+    const XMWPP_DARK_BORDER_CLASS = 'xmwpp-dm-border';
+    const XMWPP_DARK_LINK_CLASS = 'xmwpp-dm-link';
+    const XMWPP_DARK_SKIP_SELECTOR = '.xmwpp-float-ball';
 
-        const style = document.createElement('style');
-        style.id = styleId;
-        style.textContent = `
-            html, body {
-                background: #0d0d0d !important;
-                color: #e0e0e0 !important;
+    // 不参与扫描的元素（脚本自身不在此列，弹窗需要跟随主题）
+    const XMWPP_DARK_SKIP_TAGS = {
+        SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, LINK: 1, META: 1, HEAD: 1, TITLE: 1,
+        IMG: 1, VIDEO: 1, AUDIO: 1, CANVAS: 1, SVG: 1, IFRAME: 1, OBJECT: 1, EMBED: 1
+    };
+
+    const XMWPP_DARK_LIGHT_THRESHOLD = 0.5;      // 背景亮度高于此值 → 视为浅底
+    const XMWPP_DARK_DARK_TEXT_THRESHOLD = 0.45; // 文字亮度低于此值 → 视为深字
+    const XMWPP_DARK_MIN_RESCAN_INTERVAL = 500;  // 两次增量扫描最小间隔(ms)
+
+    let darkObserver = null;
+    let darkScanTimer = null;
+    let darkScanQueued = false;
+    let darkPendingRoots = null;
+    let darkLastScan = 0;
+    // 记录被我们改过色的元素：站点是 React，重渲染可能覆盖 className，
+    // 用这个集合精确判断“某个改过的元素又变回浅色了”，只补一次，不做轮询。
+    let darkMarkedEls = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+
+    // 解析 computedStyle 颜色字符串（rgba()+hex 兜底）
+    function parseCssColor(str) {
+        if (!str) return null;
+        str = String(str).trim();
+        if (str === 'transparent') return { r: 0, g: 0, b: 0, a: 0 };
+        let m = str.match(/^rgba?\(([^)]+)\)$/i);
+        if (m) {
+            const p = m[1].split(/[,\s/]+/).filter(Boolean);
+            if (p.length < 3) return null;
+            const n = p.map(parseFloat);
+            return { r: n[0], g: n[1], b: n[2], a: p.length >= 4 ? n[3] : 1 };
+        }
+        m = str.match(/^#([0-9a-f]{3,8})$/i);
+        if (m) {
+            let h = m[1];
+            if (h.length === 3 || h.length === 4) h = h.split('').map(c => c + c).join('');
+            const num = parseInt(h.slice(0, 6), 16);
+            const a = h.length >= 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1;
+            return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255, a };
+        }
+        return null;
+    }
+
+    // 感知亮度 0~1
+    function colorLuminance(c) {
+        return (0.299 * c.r + 0.587 * c.g + 0.114 * c.b) / 255;
+    }
+
+    // 只加标记、不撤标记的辅助函数。
+    // 关键点：加了暗色面之后，元素的 computedStyle 会被我们自己的样式改暗，
+    // 如果扫描时再按“当前样式”去判断就会把标记撤掉，导致反复闪烁。
+    // 所以这里一旦判定为浅色就只补一次，之后保持不变。
+    function addDarkMark(el, cls) {
+        try {
+            if (!el.classList.contains(cls)) el.classList.add(cls);
+            if (darkMarkedEls) darkMarkedEls.add(el);
+        } catch (e) {}
+    }
+
+    function hasAnyDarkMark(el) {
+        try {
+            return el.classList.contains(XMWPP_DARK_SURFACE_CLASS) ||
+                   el.classList.contains(XMWPP_DARK_INK_CLASS) ||
+                   el.classList.contains(XMWPP_DARK_BORDER_CLASS) ||
+                   el.classList.contains(XMWPP_DARK_LINK_CLASS);
+        } catch (e) { return false; }
+    }
+
+    // 依据当前计算样式给单个元素打标记（只加不撤，可反复调用且稳定）
+    function classifyDarkElement(el) {
+        if (!el || el.nodeType !== 1 || !el.classList) return;
+        if (XMWPP_DARK_SKIP_TAGS[el.tagName]) return;
+        if (el === document.documentElement || el === document.body) return;
+        try {
+            if (el.ownerSVGElement) return;
+            if (XMWPP_DARK_SKIP_SELECTOR && el.closest(XMWPP_DARK_SKIP_SELECTOR)) return;
+        } catch (e) {}
+
+        let cs;
+        try { cs = window.getComputedStyle(el); } catch (e) { return; }
+        if (!cs) return;
+
+        // 隐藏元素不处理（注意：不能在这里撤销已有的标记）
+        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') === 0) {
+            return;
+        }
+
+        const bg = parseCssColor(cs.backgroundColor);
+        const transparentBg = !bg || bg.a <= 0.5;
+
+        // 1) 浅色底 → 换成暗色面（保留背景图，避免破坏 Banner 等）
+        if (!transparentBg && colorLuminance(bg) > XMWPP_DARK_LIGHT_THRESHOLD) {
+            addDarkMark(el, XMWPP_DARK_SURFACE_CLASS);
+        }
+
+        // 2) 纯文字链接（锚点且自身无实底）→ 主题链接色
+        const isPlainLink = el.tagName === 'A' && transparentBg;
+        if (isPlainLink) addDarkMark(el, XMWPP_DARK_LINK_CLASS);
+
+        // 3) 深色字 → 提亮（纯文字链接除外，交由链接规则）
+        const fg = parseCssColor(cs.color);
+        if (!isPlainLink && fg && fg.a > 0.1 && colorLuminance(fg) < XMWPP_DARK_DARK_TEXT_THRESHOLD) {
+            addDarkMark(el, XMWPP_DARK_INK_CLASS);
+        }
+
+        // 4) 浅色描边 → 压暗
+        if (cs.borderTopStyle !== 'none' || cs.borderRightStyle !== 'none' ||
+            cs.borderBottomStyle !== 'none' || cs.borderLeftStyle !== 'none') {
+            const sides = ['borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor'];
+            for (const side of sides) {
+                const bc = parseCssColor(cs[side]);
+                if (bc && bc.a > 0.5 && colorLuminance(bc) > 0.7) {
+                    addDarkMark(el, XMWPP_DARK_BORDER_CLASS);
+                    break;
+                }
             }
-            div, section, article, header, footer, nav, aside, main,
-            .container, .wrapper, .content, .box, .card, .panel {
-                background-color: transparent !important;
+        }
+    }
+
+    // 扫描一棵子树（含根自身）
+    function classifyDarkTree(root) {
+        if (!root) return;
+        if (root.nodeType === 1) classifyDarkElement(root);
+        let nodes;
+        try { nodes = root.querySelectorAll ? root.querySelectorAll('*') : null; } catch (e) { return; }
+        if (!nodes) return;
+        for (const el of nodes) classifyDarkElement(el);
+    }
+
+    function darkStyleText() {
+        const scope = 'html.' + XMWPP_DARK_SCOPE_CLASS;
+        return `
+            /* 配色变量：想换主题只改这里 */
+            ${scope} {
+                color-scheme: dark;
+                --xmwpp-dm-bg: #0f1115;
+                --xmwpp-dm-surface: #1a1e26;
+                --xmwpp-dm-control: #232833;
+                --xmwpp-dm-border: #2c313c;
+                --xmwpp-dm-text: #e6e8ec;
+                --xmwpp-dm-text-dim: #9aa3b2;
+                --xmwpp-dm-link: #6ea8fe;
+                --xmwpp-dm-link-hover: #90caf9;
             }
-            [class*="work"], [class*="project"], [class*="card"],
-            [class*="item"], .comment, .comments {
-                background-color: #1a1a1a !important;
-                color: #e0e0e0 !important;
+            /* 页面底色（壁纸接管背景时让出，避免两者互相覆盖） */
+            ${scope}:not(.xmwpp-wallpaper-on),
+            ${scope}:not(.xmwpp-wallpaper-on) body {
+                background-color: var(--xmwpp-dm-bg) !important;
+                background-image: none !important;
             }
-            .xmwpp-toolkit-popup {
-                background-color: #1a1a1a !important;
-                backdrop-filter: none !important;
-                -webkit-backdrop-filter: none !important;
-                color: #e0e0e0 !important;
-                transition: all 0.3s ease !important;
+            ${scope} body {
+                color: var(--xmwpp-dm-text);
             }
-            .xmwpp-toolkit-popup div,
-            .xmwpp-toolkit-popup span,
-            .xmwpp-toolkit-popup p {
-                background-color: transparent !important;
-                backdrop-filter: none !important;
-                -webkit-backdrop-filter: none !important;
-                color: #e0e0e0 !important;
+            /* 浅底元素 → 暗色面（只换底色，不动背景图） */
+            ${scope} .${XMWPP_DARK_SURFACE_CLASS} {
+                background-color: var(--xmwpp-dm-surface) !important;
             }
-            .xmwpp-toolkit-popup div[style*="background:"] {
-                background: transparent !important;
+            /* 深色文字 → 提亮 */
+            ${scope} .${XMWPP_DARK_INK_CLASS} {
+                color: var(--xmwpp-dm-text) !important;
             }
-            .xmwpp-toolkit-popup [style*="color:#333"] {
-                color: #e0e0e0 !important;
+            /* 纯文字链接 → 主题链接色（优先级高于提亮） */
+            ${scope} .${XMWPP_DARK_LINK_CLASS},
+            ${scope} .${XMWPP_DARK_LINK_CLASS}:visited {
+                color: var(--xmwpp-dm-link) !important;
             }
-            .xmwpp-toolkit-popup hr {
-                border-color: #333 !important;
+            ${scope} .${XMWPP_DARK_LINK_CLASS}:hover,
+            ${scope} .${XMWPP_DARK_LINK_CLASS}:active {
+                color: var(--xmwpp-dm-link-hover) !important;
             }
-            .xmwpp-toolkit-popup span[style*="color:#333"] {
-                color: #e0e0e0 !important;
+            /* 浅色描边 → 压暗 */
+            ${scope} .${XMWPP_DARK_BORDER_CLASS} {
+                border-color: var(--xmwpp-dm-border) !important;
             }
-            .xmwpp-toolkit-popup-overlay {
-                background: rgba(0,0,0,0.5) !important;
-                backdrop-filter: blur(4px) !important;
-                -webkit-backdrop-filter: blur(4px) !important;
+            /* 站点页头（类名带哈希后缀，用包含匹配；#header 是 header-inner 的 id） */
+            ${scope} [class*="header-inner__"],
+            ${scope} #header,
+            ${scope} [class*="common-header__"],
+            ${scope} [class*="fake-header__"],
+            ${scope} [class*="sticky-inner-wrapper"] {
+                background-color: var(--xmwpp-dm-surface) !important;
+                color: var(--xmwpp-dm-text) !important;
             }
-            input, textarea, select {
-                background-color: #2a2a2a !important;
-                color: #e0e0e0 !important;
-                border-color: #444 !important;
+            ${scope} [class*="header-inner__"] a,
+            ${scope} #header a,
+            ${scope} [class*="common-header__"] a,
+            ${scope} [class*="fake-header__"] a {
+                color: var(--xmwpp-dm-text) !important;
             }
-            button, .btn {
-                background-color: #2a2a2a !important;
-                color: #e0e0e0 !important;
-                border-color: #444 !important;
+            /* 表单控件 */
+            ${scope} input, ${scope} textarea, ${scope} select {
+                background-color: var(--xmwpp-dm-control) !important;
+                color: var(--xmwpp-dm-text) !important;
+                border-color: var(--xmwpp-dm-border) !important;
             }
-            .header, .nav, .topbar, [class*="header"], [class*="nav"] {
-                background-color: #141414 !important;
-                color: #e0e0e0 !important;
+            ${scope} input::placeholder, ${scope} textarea::placeholder {
+                color: var(--xmwpp-dm-text-dim) !important;
             }
-            .footer, [class*="footer"] {
-                background-color: #141414 !important;
-                color: #888 !important;
+            /* 滚动条 / 选区 */
+            ${scope} * { scrollbar-color: #3a3f4b var(--xmwpp-dm-bg); }
+            ${scope} ::-webkit-scrollbar { width: 8px; height: 8px; background: var(--xmwpp-dm-bg); }
+            ${scope} ::-webkit-scrollbar-thumb { background: #3a3f4b; border-radius: 4px; }
+            ${scope} ::selection { background: rgba(124,92,255,0.35); }
+            /* 本脚本工具弹窗跟随主题 */
+            ${scope} .xmwpp-toolkit-popup {
+                background-color: var(--xmwpp-dm-surface) !important;
+                color: var(--xmwpp-dm-text) !important;
             }
-            p, span, div, li, a, .text, .desc, .name, .content {
-                color: #e0e0e0 !important;
+            ${scope} .xmwpp-toolkit-popup-overlay {
+                background: rgba(0,0,0,0.65) !important;
             }
-            a, .link { color: #6ea8fe !important; }
-            a:hover, .link:hover { color: #90caf9 !important; }
-            hr, .divider { border-color: #333 !important; }
-            ::-webkit-scrollbar { width: 8px !important; background: #1a1a1a !important; }
-            ::-webkit-scrollbar-thumb { background: #3a3a3a !important; border-radius: 4px !important; }
-            * { scrollbar-color: #3a3a3a #1a1a1a !important; }
         `;
-        document.head.appendChild(style);
+    }
+
+    function ensureDarkStyle() {
+        let style = document.getElementById(XMWPP_DARK_STYLE_ID);
+        if (!style) {
+            style = document.createElement('style');
+            style.id = XMWPP_DARK_STYLE_ID;
+            (document.head || document.documentElement).appendChild(style);
+        }
+        style.textContent = darkStyleText();
+        return style;
+    }
+
+    function removeDarkMarks() {
+        try {
+            const sel = '.' + XMWPP_DARK_SURFACE_CLASS + ',.' + XMWPP_DARK_INK_CLASS +
+                        ',.' + XMWPP_DARK_BORDER_CLASS + ',.' + XMWPP_DARK_LINK_CLASS;
+            document.querySelectorAll(sel).forEach(el => {
+                el.classList.remove(XMWPP_DARK_SURFACE_CLASS);
+                el.classList.remove(XMWPP_DARK_INK_CLASS);
+                el.classList.remove(XMWPP_DARK_BORDER_CLASS);
+                el.classList.remove(XMWPP_DARK_LINK_CLASS);
+            });
+        } catch (e) {}
+    }
+
+    // 增量扫描：合并一段时间内的 DOM 变动，带最小间隔
+    function scheduleDarkScan(roots) {
+        if (!settings.darkMode) return;
+        if (roots) {
+            if (!darkPendingRoots) darkPendingRoots = [];
+            for (const r of roots) darkPendingRoots.push(r);
+        }
+        if (darkScanQueued) return;
+        darkScanQueued = true;
+
+        const wait = Math.max(0, XMWPP_DARK_MIN_RESCAN_INTERVAL - (Date.now() - darkLastScan));
+        if (darkScanTimer) clearTimeout(darkScanTimer);
+        darkScanTimer = setTimeout(() => {
+            darkScanTimer = null;
+            darkScanQueued = false;
+            darkLastScan = Date.now();
+            const pending = darkPendingRoots;
+            darkPendingRoots = null;
+            if (!settings.darkMode) return;
+            try {
+                if (pending && pending.length) {
+                    for (const r of pending) {
+                        if (r && r.isConnected) classifyDarkTree(r);
+                    }
+                } else {
+                    classifyDarkTree(document.body);
+                }
+            } catch (e) {}
+        }, wait);
+    }
+
+    function startDarkObserver() {
+        if (darkObserver) return;
+        darkObserver = new MutationObserver(mutations => {
+            const roots = [];
+            for (const m of mutations) {
+                if (m.type === 'childList') {
+                    // 新增节点：新页面 / 新卡片 → 扫一次
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType === 1) roots.push(node);
+                    }
+                } else if (m.type === 'attributes') {
+                    // 站点是 React，重渲染可能覆盖 className 把标记冲掉。
+                    // 只处理“我们改过、现在又没标记”的元素，发现变回浅色就补一次。
+                    const t = m.target;
+                    if (t && t.nodeType === 1 && darkMarkedEls &&
+                        darkMarkedEls.has(t) && !hasAnyDarkMark(t)) {
+                        roots.push(t);
+                    }
+                }
+            }
+            if (roots.length) scheduleDarkScan(roots);
+        });
+        try {
+            darkObserver.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class', 'style']
+            });
+        } catch (e) {
+            darkObserver = null;
+        }
+    }
+
+    function stopDarkObserver() {
+        if (darkObserver) {
+            darkObserver.disconnect();
+            darkObserver = null;
+        }
+        if (darkScanTimer) {
+            clearTimeout(darkScanTimer);
+            darkScanTimer = null;
+        }
+        darkScanQueued = false;
+        darkPendingRoots = null;
+    }
+
+    function toggleDarkMode(enable) {
+        if (!enable) {
+            const wasOn = !!document.getElementById(XMWPP_DARK_STYLE_ID) ||
+                          document.documentElement.classList.contains(XMWPP_DARK_SCOPE_CLASS);
+            stopDarkObserver();
+            removeDarkMarks();
+            if (typeof WeakSet !== 'undefined') darkMarkedEls = new WeakSet();
+            const style = document.getElementById(XMWPP_DARK_STYLE_ID);
+            if (style) style.remove();
+            try { document.documentElement.classList.remove(XMWPP_DARK_SCOPE_CLASS); } catch (e) {}
+            if (wasOn) console.log('[XMW++] 深色模式已关闭');
+            return;
+        }
+
+        ensureDarkStyle();
+        try { document.documentElement.classList.add(XMWPP_DARK_SCOPE_CLASS); } catch (e) {}
+
+        if (!document.body) return;
+        // 先全量扫描一次，再挂观察器做增量（新增节点 / 标记被覆盖时补色）
+        classifyDarkTree(document.body);
+        darkLastScan = Date.now();
+        startDarkObserver();
+
         console.log('[XMW++] 深色模式已启用');
     }
 
@@ -496,25 +808,51 @@
 
     // 3.5 自定义网页壁纸（作用于本站所有页面）
     //
-    // 站点只在个人主页有背景容器（div.bgImg__1veTq），其它页面根本没有带 bgImg 类的元素；
-    // 而单纯铺在最底层的图层，会被站点某个全屏不透明元素挡在后面。
+    // 站点自己有一层铺满视口的背景（例如 div.bgImg__1veTq），它会挡住我们贴在页面最底层的图层，
     // 所以这里走「兜底层 + 就地接管」两条路：
-    //   1. 兜底层：body 第一个子节点，position:fixed + z-index:-1，
-    //      永远在页面所有卡片、文字下面，管不到的地方由它兜底；
-    //   2. 就地接管：把站点那个全屏背景元素找出来，直接把我们的壁纸涂在它身上。
-    //      它本来就夹在卡片下面，所以最终效果 = 壁纸在所有卡片下面，同时压住站点原背景。
+    //   1. 兜底层：#xmwpp-wallpaper-layer 挂在 body 第一个子节点，position:fixed + z-index:-1，
+    //      同时把 html / body 背景置透明，保证壁纸能从所有卡片、文字背后透出来；
+    //   2. 就地接管：找出站点自己的「铺满视口 + 不透明」背景元素，给它打上标记类，
+    //      再由样式表把壁纸画在它身上（它本来就夹在卡片下面），顺带压住站点原背景。
+    //
+    // 对外行为不变，内部机制换掉了：
+    //   - 接管只加/删一个标记类，不写内联样式、也不记录元素原值 →「恢复默认」时站点样式天然完好，
+    //     没有残留，也就不需要 WeakMap 回滚；
+    //   - 样式表内容固定，图片地址 / 纯色通过 CSS 变量下发 → 不需要反复重写样式表，
+    //     也不会把用户输入拼进 CSS 文本；
+    //   - 接管规则全部写在 html.<scope> 之下 → 摘掉这个 class 就等于完全退出接管；
+    //   - 候选收集收敛（视口中心命中栈 + body 顶层两层 + 名字带 bg/backdrop 的元素）且设上限，
+    //     完整重扫有最小间隔，DOM 变动只做一次防抖同步。
     const XMWPP_WALLPAPER_STYLE_ID = 'xmwpp-wallpaper-style';
     const XMWPP_WALLPAPER_LAYER_ID = 'xmwpp-wallpaper-layer';
     const XMWPP_WALLPAPER_SCOPE_CLASS = 'xmwpp-wallpaper-on';
-    const XMWPP_WALLPAPER_PROPS = [
-        'background-image', 'background-color', 'background-size',
-        'background-position', 'background-repeat', 'background-attachment'
-    ];
-    // 站点背景元素的原始内联样式，用于「恢复默认」时还原
-    const wallpaperOriginals = new WeakMap();
-    let wallpaperBackdrops = [];
-    let lastBackdropScan = 0;
+    const XMWPP_WALLPAPER_BACKDROP_CLASS = 'xmwpp-wallpaper-backdrop';
+    const XMWPP_WALLPAPER_IMAGE_VAR = '--xmwpp-wallpaper-image';
+    const XMWPP_WALLPAPER_COLOR_VAR = '--xmwpp-wallpaper-color';
+
+    // 站点自带的背景容器（class 名带 hash 后缀，用包含匹配）
+    const XMWPP_BGIMG_SELECTORS = ['div[class*="bgImg__"]', 'div[class*="BgImg__"]'];
+    // 名字里带 bg / background / backdrop 的元素，作为全屏背景候选
+    const XMWPP_BACKDROP_QUERY = [
+        '[class*="bg" i]', '[id*="bg" i]',
+        '[class*="background" i]', '[id*="background" i]',
+        '[class*="backdrop" i]', '[id*="backdrop" i]'
+    ].join(',');
+    // 脚本自己的 UI，绝不当成站点背景
+    const XMWPP_BACKDROP_SKIP = [
+        '.xmwpp-toolkit-popup', '.xmwpp-toolkit-popup-overlay', '.xmwpp-float-ball'
+    ].join(',');
+
+    const XMWPP_BACKDROP_MAX_SCAN = 400;      // 候选上限
+    const XMWPP_BACKDROP_MAX_TAKEOVER = 6;    // 同时接管的元素上限（正常页面不会有这么多全屏背景）
+    const XMWPP_BACKDROP_MIN_INTERVAL = 600;  // 两次完整重扫的最小间隔(ms)
+
     let wallpaperObserver = null;
+    let wallpaperSyncTimer = null;
+    let wallpaperResizeBound = false;
+    let wallpaperForceScan = false;
+    let backdropRetryTimer = null;
+    let lastBackdropScan = 0;
     let currentWallpaper = '';
     let currentWallpaperIsColor = false;
 
@@ -522,40 +860,88 @@
         return typeof v === 'string' && /^#([0-9a-f]{3,8})$/i.test(v.trim());
     }
 
-    function xmwppWallpaperLayersCss() {
-        const isColor = currentWallpaperIsColor;
-        const image = isColor ? 'none' : 'url("' + currentWallpaper + '")';
-        const placement = isColor ? '' : `
-                background-size: cover !important;
-                background-position: center center !important;
-                background-repeat: no-repeat !important;`;
+    // url(...) 里的引号 / 反斜杠转义，避免地址破坏 CSS 变量值
+    function escapeCssUrl(url) {
+        return String(url || '').replace(/[\\"]/g, '\\$&').replace(/[\r\n\f]/g, '');
+    }
+
+    // ---------- 样式表：固定内容，颜色/图片走 CSS 变量 ----------
+
+    function wallpaperStyleCss() {
+        const scope = 'html.' + XMWPP_WALLPAPER_SCOPE_CLASS;
+        const bgImgRules = XMWPP_BGIMG_SELECTORS.map(sel => scope + ' ' + sel).join(',\n            ');
         return `
             /* 兜底壁纸层：负 z-index，永远在页面所有卡片/文字下面 */
-            #${XMWPP_WALLPAPER_LAYER_ID} {
+            ${scope} #${XMWPP_WALLPAPER_LAYER_ID} {
                 position: fixed !important;
-                top: 0 !important;
-                left: 0 !important;
-                right: 0 !important;
-                bottom: 0 !important;
-                width: 100% !important;
-                height: 100% !important;
-                margin: 0 !important;
-                padding: 0 !important;
-                border: 0 !important;
-                display: block !important;
-                pointer-events: none !important;
+                top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+                width: 100% !important; height: 100% !important;
+                margin: 0 !important; padding: 0 !important; border: 0 !important;
+                display: block !important; pointer-events: none !important;
                 z-index: -1 !important;
-                background-image: ${image} !important;
-                background-color: ${isColor ? currentWallpaper : 'transparent'} !important;${placement}
+                background-color: var(${XMWPP_WALLPAPER_COLOR_VAR}, transparent) !important;
+                background-image: var(${XMWPP_WALLPAPER_IMAGE_VAR}, none) !important;
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;
             }
             /* html / body 保持透明，壁纸才能从页面内容背后透出来 */
-            html.${XMWPP_WALLPAPER_SCOPE_CLASS},
-            html.${XMWPP_WALLPAPER_SCOPE_CLASS} body {
+            ${scope},
+            ${scope} body {
                 background-color: transparent !important;
                 background-image: none !important;
             }
+            /* 就地接管：站点背景容器 + 扫描命中的全屏背景元素，直接画上壁纸 */
+            ${bgImgRules},
+            ${scope} .${XMWPP_WALLPAPER_BACKDROP_CLASS} {
+                background-color: var(${XMWPP_WALLPAPER_COLOR_VAR}, transparent) !important;
+                background-image: var(${XMWPP_WALLPAPER_IMAGE_VAR}, none) !important;
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;
+            }
+            /* 接管的全屏元素跟视口一起固定，滚动时壁纸不跟着跑 */
+            ${scope} .${XMWPP_WALLPAPER_BACKDROP_CLASS} {
+                background-attachment: fixed !important;
+            }
         `;
     }
+
+    function ensureWallpaperStyle() {
+        let style = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
+        if (style) return style;
+        style = document.createElement('style');
+        style.id = XMWPP_WALLPAPER_STYLE_ID;
+        style.textContent = wallpaperStyleCss();
+        (document.head || document.documentElement).appendChild(style);
+        return style;
+    }
+
+    function removeWallpaperStyle() {
+        const style = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
+        if (style) style.remove();
+    }
+
+    // 壁纸地址只下发给 CSS 变量（setProperty 会做合法性校验，坏了也只是这一条失效）
+    function setWallpaperVars() {
+        try {
+            const root = document.documentElement;
+            root.style.setProperty(XMWPP_WALLPAPER_IMAGE_VAR,
+                currentWallpaperIsColor ? 'none' : 'url("' + escapeCssUrl(currentWallpaper) + '")');
+            root.style.setProperty(XMWPP_WALLPAPER_COLOR_VAR,
+                currentWallpaperIsColor ? currentWallpaper : 'transparent');
+        } catch (e) {}
+    }
+
+    function clearWallpaperVars() {
+        try {
+            const root = document.documentElement;
+            root.style.removeProperty(XMWPP_WALLPAPER_IMAGE_VAR);
+            root.style.removeProperty(XMWPP_WALLPAPER_COLOR_VAR);
+        } catch (e) {}
+    }
+
+    // ---------- 兜底层 ----------
 
     function ensureWallpaperLayer() {
         let layer = document.getElementById(XMWPP_WALLPAPER_LAYER_ID);
@@ -564,118 +950,18 @@
             layer.id = XMWPP_WALLPAPER_LAYER_ID;
             layer.setAttribute('aria-hidden', 'true');
         }
-        try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
+        if (!document.body) return null;
         // 挂在 body 第一个子节点：z-index:-1 的图层若父级建立了层叠上下文会失效
         if (layer.parentNode !== document.body || document.body.firstChild !== layer) {
             try { document.body.insertBefore(layer, document.body.firstChild); } catch (e) { return null; }
         }
+        try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
         return layer;
-    }
-
-    // 样式表始终放到 head 末尾，保证优先级最高（不会被深色模式等后插入的样式盖掉）
-    function setWallpaperStyle(css) {
-        const old = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
-        if (old) old.remove();
-        if (!css) return;
-        const style = document.createElement('style');
-        style.id = XMWPP_WALLPAPER_STYLE_ID;
-        style.textContent = css;
-        (document.head || document.documentElement).appendChild(style);
-    }
-
-    // 给兜底图层打内联样式，作为样式表被清掉时的兜底
-    function paintWallpaperLayer() {
-        const layer = ensureWallpaperLayer();
-        if (!layer) return 0;
-        try {
-            layer.style.setProperty('position', 'fixed', 'important');
-            layer.style.setProperty('top', '0', 'important');
-            layer.style.setProperty('left', '0', 'important');
-            layer.style.setProperty('width', '100vw', 'important');
-            layer.style.setProperty('height', '100vh', 'important');
-            layer.style.setProperty('pointer-events', 'none', 'important');
-            layer.style.setProperty('z-index', '-1', 'important');
-            if (currentWallpaperIsColor) {
-                layer.style.setProperty('background-image', 'none', 'important');
-                layer.style.setProperty('background-color', currentWallpaper, 'important');
-            } else {
-                layer.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
-                layer.style.setProperty('background-color', 'transparent', 'important');
-                layer.style.setProperty('background-size', 'cover', 'important');
-                layer.style.setProperty('background-position', 'center center', 'important');
-                layer.style.setProperty('background-repeat', 'no-repeat', 'important');
-            }
-        } catch (e) {}
-        return 1;
-    }
-
-    // ---------- 站点背景元素 div.bgImg__1veTq 的图片地址同步 ----------
-
-    // 精确匹配页面里的 bgImg 背景元素（含各种 hash 后缀）
-    const XMWPP_BGIMG_SELECTOR = 'div.bgImg__1veTq, div[class*="bgImg__"], div[class*="BgImg__"]';
-    const bgImgOriginals = new WeakMap();
-    let syncedBgImg = [];
-
-    // 从内联 style 或计算样式里取出 background-image 的 url
-    function extractBgUrl(el) {
-        let raw = '';
-        try { raw = el.style.getPropertyValue('background-image') || ''; } catch (e) {}
-        if (!raw || raw === 'none') {
-            try {
-                const cs = window.getComputedStyle(el);
-                raw = (cs && cs.backgroundImage) || '';
-            } catch (e) {}
-        }
-        if (!raw || raw === 'none') return '';
-        const m = raw.match(/url\((['"]?)(.*?)\1\)/i);
-        return m && m[2] ? m[2] : '';
-    }
-
-    // 把 bgImg 元素上原有的图片地址换成我们设置的地址（纯色模式保留站点原图，不做改动）
-    function syncBgImgElement(el) {
-        if (!currentWallpaper || currentWallpaperIsColor) return false;
-        const oldUrl = extractBgUrl(el);
-        try {
-            if (!bgImgOriginals.has(el)) bgImgOriginals.set(el, oldUrl);
-            el.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
-            el.style.setProperty('background-size', 'cover', 'important');
-            el.style.setProperty('background-position', 'center center', 'important');
-            el.style.setProperty('background-repeat', 'no-repeat', 'important');
-        } catch (e) {
-            return false;
-        }
-        if (oldUrl && oldUrl !== currentWallpaper) {
-            console.log('[XMW++] bgImg 图片地址已同步:', oldUrl, '->', currentWallpaper);
-        }
-        return true;
-    }
-
-    function resetBgImgElement(el) {
-        const original = bgImgOriginals.get(el);
-        bgImgOriginals.delete(el);
-        if (original === undefined) return;
-        try {
-            if (original) el.style.setProperty('background-image', 'url("' + original + '")', 'important');
-            else el.style.removeProperty('background-image');
-        } catch (e) {}
-    }
-
-    // 遍历页面上所有 bgImg 元素并同步（新出现的元素也会被找到）
-    function syncAllBgImgElements() {
-        const next = [];
-        try {
-            document.querySelectorAll(XMWPP_BGIMG_SELECTOR).forEach(el => {
-                if (syncBgImgElement(el)) next.push(el);
-            });
-        } catch (e) {}
-        syncedBgImg.forEach(el => { if (next.indexOf(el) < 0) resetBgImgElement(el); });
-        syncedBgImg = next;
-        return next.length;
     }
 
     // ---------- 找出站点自己的全屏背景元素（就是挡住壁纸的那个） ----------
 
-    // 背景是否「不透明」：带 alpha 的底色或任意背景图都算
+    // 背景是否「不透明」：不透明底色或任意背景图都算
     function hasOpaquePaint(cs) {
         const bg = (cs.backgroundColor || '').replace(/\s/g, '');
         let alpha = 0;
@@ -689,47 +975,64 @@
         return !!cs.backgroundImage && cs.backgroundImage !== 'none';
     }
 
-    // 判定标准：铺满视口 + 底色不透明（或带背景图）+ 不是弹窗遮罩
-    function isFullScreenBackdrop(el) {
-        if (!el || el.nodeType !== 1) return false;
-        if (el.id === XMWPP_WALLPAPER_LAYER_ID) return false;
+    function viewportSize() {
+        const de = document.documentElement;
+        return {
+            w: (de && de.clientWidth) || window.innerWidth || 0,
+            h: (de && de.clientHeight) || window.innerHeight || 0
+        };
+    }
+
+    // 判定标准：铺满视口 + 底色不透明（或带背景图）+ 不是弹窗遮罩 / 多媒体元素
+    function isBackdropElement(el, vp) {
+        if (!el || el.nodeType !== 1 || !el.classList) return false;
         if (el === document.body || el === document.documentElement) return false;
-        if (!el.classList) return false;
-        if (el.classList.contains('xmwpp-toolkit-popup') ||
-            el.classList.contains('xmwpp-toolkit-popup-overlay') ||
-            el.classList.contains('xmwpp-float-ball')) return false;
+        if (el.id === XMWPP_WALLPAPER_LAYER_ID) return false;
+        try { if (el.closest(XMWPP_BACKDROP_SKIP)) return false; } catch (e) {}
+        const tag = el.tagName;
+        if (tag === 'IMG' || tag === 'VIDEO' || tag === 'CANVAS' ||
+            tag === 'IFRAME' || tag === 'SVG' || tag === 'OBJECT') return false;
+
         let cs;
         try { cs = window.getComputedStyle(el); } catch (e) { return false; }
         if (!cs) return false;
         if (cs.display === 'none' || cs.visibility === 'hidden') return false;
         if (parseFloat(cs.opacity || '1') === 0) return false;
         if (!hasOpaquePaint(cs)) return false;
-        const r = el.getBoundingClientRect();
-        if (r.width < window.innerWidth * 0.9 || r.height < window.innerHeight * 0.9) return false;
-        if (r.top > 8 || r.left > 8) return false;
+
         const z = parseInt(cs.zIndex, 10);
         if (!isNaN(z) && z > 900) return false;   // 疑似弹窗/浮层遮罩，不碰
+
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+        if (r.width < vp.w * 0.9 || r.height < vp.h * 0.9) return false;
+        // 允许一点偏移：首个子元素的 margin 折叠会把包裹层整体往下推几个像素
+        if (r.top > vp.h * 0.05 || r.left > vp.w * 0.05) return false;
         return true;
     }
 
     function collectBackdropCandidates() {
         const out = [];
-        const push = el => { if (el && out.indexOf(el) < 0) out.push(el); };
-        if (!document.body) return out;
+        const seen = new Set();
+        const push = el => {
+            if (!el || el.nodeType !== 1 || seen.has(el)) return;
+            seen.add(el);
+            out.push(el);
+        };
 
-        // 1) 命中测试：视口中心这一列上的所有元素（从最上层到最下层）
+        // 1) 视口中心这一列的命中栈：从最底层往上，真正的全屏背景一定在这里
         try {
             const stack = document.elementsFromPoint(window.innerWidth / 2, window.innerHeight / 2) || [];
             for (let i = stack.length - 1; i >= 0; i--) push(stack[i]);
         } catch (e) {}
 
-        // 2) body 前两层的子元素
+        // 2) body 顶层两层（全屏背景基本都是页面顶层的包裹层）
         try {
-            let inspected = 0;
+            let n = 0;
             const scan = (parent, depth) => {
-                if (!parent || depth > 2 || inspected > 200) return;
+                if (!parent || depth > 2 || n > 200) return;
                 for (const el of parent.children) {
-                    if (inspected++ > 200) return;
+                    if (++n > 200) return;
                     push(el);
                     if (depth < 2) scan(el, depth + 1);
                 }
@@ -739,129 +1042,140 @@
 
         // 3) 名字里带 bg / background / backdrop 的元素（pointer-events:none 也能捞到）
         try {
-            const named = document.querySelectorAll(
-                '[class*="bg" i], [id*="bg" i], [class*="background" i], [id*="background" i],' +
-                '[class*="backdrop" i], [id*="backdrop" i]'
-            );
-            for (let i = 0; i < named.length && i < 400; i++) push(named[i]);
+            const named = document.querySelectorAll(XMWPP_BACKDROP_QUERY);
+            for (let i = 0; i < named.length && out.length < XMWPP_BACKDROP_MAX_SCAN; i++) push(named[i]);
         } catch (e) {}
 
         return out;
     }
 
-    function readBackdropStyle(el) {
-        const saved = {};
-        for (const prop of XMWPP_WALLPAPER_PROPS) {
-            saved[prop] = el.style.getPropertyValue(prop);
-            saved[prop + '!'] = el.style.getPropertyPriority(prop);
-        }
-        return saved;
-    }
-
-    function resetBackdrop(el) {
-        const saved = wallpaperOriginals.get(el);
-        if (!saved) return;
-        for (const prop of XMWPP_WALLPAPER_PROPS) {
-            try {
-                if (saved[prop]) el.style.setProperty(prop, saved[prop], saved[prop + '!'] || '');
-                else el.style.removeProperty(prop);
-            } catch (e) {}
-        }
-        wallpaperOriginals.delete(el);
-    }
-
-    function paintBackdrop(el) {
-        if (!wallpaperOriginals.has(el)) wallpaperOriginals.set(el, readBackdropStyle(el));
-        try {
-            if (currentWallpaperIsColor) {
-                el.style.setProperty('background-image', 'none', 'important');
-                el.style.setProperty('background-color', currentWallpaper, 'important');
-            } else {
-                el.style.setProperty('background-image', 'url("' + currentWallpaper + '")', 'important');
-                el.style.setProperty('background-size', 'cover', 'important');
-                el.style.setProperty('background-position', 'center center', 'important');
-                el.style.setProperty('background-repeat', 'no-repeat', 'important');
-                el.style.setProperty('background-attachment', 'fixed', 'important');
-            }
-        } catch (e) {}
-    }
-
-    // 把壁纸涂到站点自己的全屏背景元素上（它本来就在卡片下面）
-    function paintSiteBackdrops() {
-        const next = collectBackdropCandidates().filter(isFullScreenBackdrop);
-        wallpaperBackdrops.forEach(el => { if (next.indexOf(el) < 0) resetBackdrop(el); });
-        wallpaperBackdrops = next;
-        next.forEach(paintBackdrop);
-        return next.length;
-    }
-
-    // 高频调用时的省流路径：背景元素还在就只重涂，最多 1.5s 做一次完整重扫
-    function refreshSiteBackdrops() {
+    // 重算「全屏不透明的站点背景元素」集合并打/撤标记类，返回当前接管数量
+    function refreshBackdrops(force) {
         const now = Date.now();
-        const alive = wallpaperBackdrops.length > 0 && wallpaperBackdrops.every(el => el.isConnected);
-        if (alive && now - lastBackdropScan < 1500) {
-            wallpaperBackdrops.forEach(paintBackdrop);
-            return wallpaperBackdrops.length;
+        if (!force && now - lastBackdropScan < XMWPP_BACKDROP_MIN_INTERVAL) {
+            // 被节流挡下：补扫一次，别把这次同步丢掉
+            if (!backdropRetryTimer) {
+                backdropRetryTimer = setTimeout(() => {
+                    backdropRetryTimer = null;
+                    if (currentWallpaper) refreshBackdrops(true);
+                }, XMWPP_BACKDROP_MIN_INTERVAL);
+            }
+            return -1;
         }
         lastBackdropScan = now;
-        return paintSiteBackdrops();
+
+        const vp = viewportSize();
+        let taken = 0;
+
+        // 先撤掉不再合格的标记（元素被复用、改了尺寸、被弹窗盖住等）
+        try {
+            document.querySelectorAll('.' + XMWPP_WALLPAPER_BACKDROP_CLASS).forEach(el => {
+                if (isBackdropElement(el, vp)) taken++;
+                else el.classList.remove(XMWPP_WALLPAPER_BACKDROP_CLASS);
+            });
+        } catch (e) {}
+
+        // 再补上新出现的
+        try {
+            for (const el of collectBackdropCandidates()) {
+                if (taken >= XMWPP_BACKDROP_MAX_TAKEOVER) break;
+                if (el.classList.contains(XMWPP_WALLPAPER_BACKDROP_CLASS)) continue;
+                if (!isBackdropElement(el, vp)) continue;
+                el.classList.add(XMWPP_WALLPAPER_BACKDROP_CLASS);
+                taken++;
+            }
+        } catch (e) {}
+
+        return taken;
+    }
+
+    // ---------- 观察器：SPA 重渲染 / 窗口尺寸变化后补一次同步 ----------
+
+    function scheduleWallpaperSync(force) {
+        if (!currentWallpaper) return;
+        if (force) wallpaperForceScan = true;
+        if (wallpaperSyncTimer) return;
+        wallpaperSyncTimer = setTimeout(() => {
+            wallpaperSyncTimer = null;
+            if (!currentWallpaper) return;
+            const needForce = wallpaperForceScan;
+            wallpaperForceScan = false;
+            if (!document.getElementById(XMWPP_WALLPAPER_STYLE_ID)) ensureWallpaperStyle();
+            ensureWallpaperLayer();
+            refreshBackdrops(needForce);
+        }, 300);
     }
 
     function startWallpaperObserver() {
-        if (wallpaperObserver) return;
-        let queued = false;
-        wallpaperObserver = new MutationObserver(() => {
-            if (!currentWallpaper || queued) return;
-            queued = true;
-            setTimeout(() => {
-                queued = false;
-                if (!currentWallpaper) return;
-                const style = document.getElementById(XMWPP_WALLPAPER_STYLE_ID);
-                if (!style || style !== document.head.lastElementChild) {
-                    setWallpaperStyle(xmwppWallpaperLayersCss());
-                }
-                try { document.documentElement.classList.add(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
-                paintWallpaperLayer();
-                refreshSiteBackdrops();
-                syncAllBgImgElements();
-            }, 300);
-        });
-        wallpaperObserver.observe(document.documentElement, { childList: true, subtree: true });
+        if (!wallpaperObserver) {
+            wallpaperObserver = new MutationObserver(() => scheduleWallpaperSync(false));
+            try {
+                wallpaperObserver.observe(document.documentElement, { childList: true, subtree: true });
+            } catch (e) {
+                wallpaperObserver = null;
+            }
+        }
+        if (!wallpaperResizeBound) {
+            wallpaperResizeBound = true;
+            let resizeTimer = null;
+            window.addEventListener('resize', () => {
+                if (resizeTimer) clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => scheduleWallpaperSync(true), 300);
+            });
+        }
     }
+
+    // ---------- 对外接口 ----------
 
     function clearWallpaper() {
         if (wallpaperObserver) {
             wallpaperObserver.disconnect();
             wallpaperObserver = null;
         }
-        wallpaperBackdrops.forEach(resetBackdrop);
-        wallpaperBackdrops = [];
-        syncedBgImg.forEach(resetBgImgElement);
-        syncedBgImg = [];
+        if (wallpaperSyncTimer) {
+            clearTimeout(wallpaperSyncTimer);
+            wallpaperSyncTimer = null;
+        }
+        if (backdropRetryTimer) {
+            clearTimeout(backdropRetryTimer);
+            backdropRetryTimer = null;
+        }
+        wallpaperForceScan = false;
+
+        // 标记类和样式表一撤，站点元素立刻回到自己的原始样式
+        try {
+            document.querySelectorAll('.' + XMWPP_WALLPAPER_BACKDROP_CLASS).forEach(el => {
+                el.classList.remove(XMWPP_WALLPAPER_BACKDROP_CLASS);
+            });
+        } catch (e) {}
         const layer = document.getElementById(XMWPP_WALLPAPER_LAYER_ID);
         if (layer) layer.remove();
-        setWallpaperStyle('');
+        removeWallpaperStyle();
+        clearWallpaperVars();
         try { document.documentElement.classList.remove(XMWPP_WALLPAPER_SCOPE_CLASS); } catch (e) {}
+
         currentWallpaper = '';
         currentWallpaperIsColor = false;
+        lastBackdropScan = 0;
     }
 
     function applyWallpaper(url) {
         const value = (url || '').trim();
         if (!value) {
-            restoreDefaultWallpaper();
+            clearWallpaper();
             return;
         }
         currentWallpaper = value;
         currentWallpaperIsColor = isColorValue(value);
-        setWallpaperStyle(xmwppWallpaperLayersCss());
-        paintWallpaperLayer();
-        lastBackdropScan = Date.now();
-        const n = paintSiteBackdrops();
-        const m = syncAllBgImgElements();
+
+        ensureWallpaperStyle();
+        setWallpaperVars();
+        ensureWallpaperLayer();
+        const n = refreshBackdrops(true);
         startWallpaperObserver();
+
         console.log('[XMW++] 全站壁纸已应用:', currentWallpaperIsColor ? currentWallpaper : '(图片) ' + currentWallpaper,
-                    '| 已接管站点背景元素 ' + n + ' 个');
+                    '| 已接管站点背景元素 ' + (n < 0 ? 0 : n) + ' 个');
     }
 
     function restoreDefaultWallpaper() {
@@ -874,8 +1188,11 @@
     function toggleCustomWallpaper(enable) {
         if (enable) {
             if (settings.wallpaperUrl) applyWallpaper(settings.wallpaperUrl);
+            else console.log('[XMW++] 壁纸已开启，但还没设置地址');
         } else {
-            restoreDefaultWallpaper();
+            // 只停止渲染，保留已保存的地址，下次开启能直接恢复
+            clearWallpaper();
+            console.log('[XMW++] 壁纸已关闭');
         }
     }
 
@@ -1492,7 +1809,8 @@
             wallpaper: settings.customWallpaper,
             font: settings.customFont || '',
             wallpaperUrl: settings.wallpaperUrl || '',
-            linkify: settings.autoLinkify
+            linkify: settings.autoLinkify,
+            reload404: settings.autoReload404
         };
         const fontExpanded = !!state.font;
 
@@ -1679,6 +1997,18 @@
                         </div>
                     </div>
                     <div style="font-size:11.5px;color:#999;padding-bottom:9px;">识别页面文本中的网址并显示为蓝色，点击即可在新标签页打开</div>
+
+                    <hr style="border:none;border-top:1px solid #f0f0f0;margin:11px 0;">
+
+                    <!-- 404 自动刷新 -->
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;">
+                        <div style="display:flex;align-items:center;gap:12px;">
+                            <span style="font-weight:500;color:#333;font-size:13.5px;">404 自动刷新</span>
+                            <span style="font-size:11.5px;color:${state.reload404 ? '#22c55e' : '#999'};">状态: ${state.reload404 ? '已启用' : '已关闭'}</span>
+                        </div>
+                        <button id="xmwpp-toggle-reload404" style="background:${state.reload404 ? '#ccc' : '#7c5cff'};color:#fff;border:none;padding:5px 18px;border-radius:22px;font-size:12.5px;cursor:pointer;font-weight:500;">${state.reload404 ? '关闭' : '启用'}</button>
+                    </div>
+                    <div style="font-size:11.5px;color:#999;padding-bottom:9px;">检测到真的 404 页面时自动刷新一次。本站跳转时可能瞬时出现 404 块，开启后存在误刷新风险，故默认关闭</div>
                 </div>
 
                 <!-- ===== 关于 标签页 ===== -->
@@ -1688,7 +2018,7 @@
                         <div style="font-size:19px;font-weight:700;color:#0f172a;margin-bottom:5px;">XMW++</div>
                         <div style="font-size:13px;color:#888;margin-bottom:24px;">小码王社区 · 多功能工具箱</div>
                         <div style="font-size:13px;color:#555;line-height:2;text-align:left;max-width:320px;margin:0 auto;">
-                            <div style="display:flex;justify-content:space-between;"><span style="color:#999;">版本</span><span style="font-weight:500;">v2.3</span></div>
+                            <div style="display:flex;justify-content:space-between;"><span style="color:#999;">版本</span><span style="font-weight:500;">v2.3.2</span></div>
                             <div style="display:flex;justify-content:space-between;"><span style="color:#999;">作者</span><span style="font-weight:500;">Toushou</span></div>
                             <div style="display:flex;justify-content:space-between;"><span style="color:#999;">许可</span><span style="font-weight:500;">MIT</span></div>
                         </div>
@@ -1818,6 +2148,15 @@
                 this.textContent = original;
                 this.style.background = '#7c5cff';
             }, 2000);
+        });
+
+        // 404 自动刷新
+        popup.querySelector('#xmwpp-toggle-reload404').addEventListener('click', function() {
+            settings.autoReload404 = !settings.autoReload404;
+            saveSettings();
+            set404Watcher(settings.autoReload404);
+            overlay.remove();
+            showToolkitPopup();
         });
 
         // RGB
@@ -1972,7 +2311,7 @@
     function init() {
         initZoom();
         startRemovingSiteElements();
-        watch404Page();
+        if (settings.autoReload404) set404Watcher(true);
 
         setTimeout(addFloatingBall, 1000);
         setTimeout(addFloatingBall, 3000);
@@ -2000,7 +2339,7 @@
             setTimeout(() => toggleAutoLinkify(true), 1200);
         }
 
-        console.log('[XMW++] 已加载 v2.3');
+        console.log('[XMW++] 已加载 v2.3.2');
         console.log('[XMW++] 仓库: https://github.com/Toushou-114514/XMWPP');
     }
 
