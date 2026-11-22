@@ -59,9 +59,20 @@
 
 ---
 
+## ✌️ 分支
+你可能会发现仓库里还有一个[XMW++（星落鲤跃の优化版）.js](XMW++（星落鲤跃の优化版）.js)
+
+那是由*xmw*中一个大佬 [星落鲤跃](https://world.xiaomawang.com/w/person/project/all/4817380) 制作的优化版
+
+想要对比两个版本的区别请看[这里](两个版本对比.md)
+
+---
+
 ## 🍥 工具作者
 
 **Toushou，~~Deepseek~~**
+
+~~不更了兄弟们~~
 
 ---
 ## 📄 许可证
@@ -80,7 +91,7 @@
 
 ##给投手一个STAR吧
 
-<img width="176" height="176" alt="ts" src="https://github.com/user-attachments/assets/74d6b636-b4f6-4338-889b-8467f17e76ac" />
+<img width="176" height="176" alt="ts" src="https://www.toushou.top/ts.png" />
 
 ---
 
